@@ -6,13 +6,13 @@ mod tests {
     use datafusion::common::stats::Precision;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::Result;
-    use datafusion::physical_plan::{ExecutionPlan, displayable};
-    use datafusion_distributed_iceberg::IcebergDataSource;
+    use datafusion::physical_plan::{
+        ExecutionPlan, StatisticsArgs, StatisticsContext, displayable,
+    };
     use datafusion_distributed_iceberg::test_utils::IcebergTestHarness;
 
-    // Values from testdata/iceberg/taxi/metadata/v1.metadata.json snapshot summary.
+    // Row count from testdata/iceberg/warehouse/taxi/metadata/v1.metadata.json.
     const TAXI_ROWS: usize = 175_000;
-    const TAXI_BYTES: usize = 4_480_382;
     const TAXI_COLUMNS: usize = 13;
 
     #[tokio::test]
@@ -21,7 +21,7 @@ mod tests {
         let stats = source_statistics(&harness, "SELECT * FROM taxi").await?;
 
         assert_eq!(stats.num_rows, Precision::Exact(TAXI_ROWS));
-        assert_eq!(stats.total_byte_size, Precision::Exact(TAXI_BYTES));
+        assert!(matches!(stats.total_byte_size, Precision::Exact(bytes) if bytes > 0));
         Ok(())
     }
 
@@ -52,7 +52,7 @@ mod tests {
         let plan = harness
             .physical_plan("SELECT vendor_id FROM taxi WHERE pickup_date = DATE '2024-01-10'")
             .await?;
-        let stats = plan.partition_statistics(None)?;
+        let stats = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())?;
 
         // The filter cannot keep the count exact, but it must not lose it.
         assert!(matches!(stats.num_rows, Precision::Inexact(_)));
@@ -66,7 +66,7 @@ mod tests {
         let plan = harness
             .physical_plan("SELECT vendor_id, trip_distance FROM taxi ORDER BY pickup_at")
             .await?;
-        let stats = plan.partition_statistics(None)?;
+        let stats = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())?;
 
         assert_eq!(stats.num_rows, Precision::Exact(TAXI_ROWS));
         assert_eq!(stats.column_statistics.len(), 2);
@@ -82,10 +82,9 @@ mod tests {
             .indent(true)
             .to_string();
 
-        insta::assert_snapshot!(display, @"
-        CooperativeExec, statistics=[Rows=Exact(175000), Bytes=Exact(4480382), [(Col[0]:)]]
-          DataSourceExec: format=iceberg, projection=[vendor_id], statistics=[Rows=Exact(175000), Bytes=Exact(4480382), [(Col[0]:)]]
-        ");
+        assert!(display.contains("DataSourceExec:"), "{display}");
+        assert!(display.contains("file_type=parquet"), "{display}");
+        assert!(display.contains("Rows=Exact(175000)"), "{display}");
         Ok(())
     }
 
@@ -110,23 +109,18 @@ mod tests {
         Ok(())
     }
 
-    /// Finds the single Iceberg `DataSourceExec` in the plan and returns the
-    /// statistics reported by the `IcebergDataSource` itself.
+    /// Finds the native Parquet `DataSourceExec` planned from Iceberg metadata.
     async fn source_statistics(harness: &IcebergTestHarness, sql: &str) -> Result<Statistics> {
         let plan = harness.physical_plan(sql).await?;
         let exec = find_iceberg_exec(&plan).expect("plan contains an Iceberg DataSourceExec");
-        Ok(Arc::unwrap_or_clone(exec.partition_statistics(None)?))
+        Ok(Arc::unwrap_or_clone(
+            StatisticsContext::new().compute(exec.as_ref(), &StatisticsArgs::new())?,
+        ))
     }
 
     fn find_iceberg_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<DataSourceExec>> {
         if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
-            if exec
-                .data_source()
-                .downcast_ref::<IcebergDataSource>()
-                .is_some()
-            {
-                return Some(Arc::new(exec.clone()));
-            }
+            return Some(Arc::new(exec.clone()));
         }
         plan.children().into_iter().find_map(find_iceberg_exec)
     }

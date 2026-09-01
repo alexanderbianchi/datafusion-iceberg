@@ -16,7 +16,9 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result as IcebergResult};
+use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{IcebergExt, IcebergIntegrationOptions};
 
@@ -38,6 +40,11 @@ impl IcebergTestHarness {
             })
             .build();
         let ctx = SessionContext::new_with_state(state);
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg");
+        ctx.register_object_store(
+            &Url::parse("s3://iceberg-test").expect("valid fixture object-store URL"),
+            Arc::new(LocalFileSystem::new_with_prefix(fixture_root)?),
+        );
         ctx.sql(&format!(
             "CREATE EXTERNAL TABLE taxi STORED AS ICEBERG \
          LOCATION '{FIXTURE_URI}/metadata/v1.metadata.json'"
@@ -65,14 +72,14 @@ impl IcebergTestHarness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FixtureStorageFactory {
+pub struct FixtureStorageFactory {
     root: PathBuf,
 }
 
 impl Default for FixtureStorageFactory {
     fn default() -> Self {
         Self {
-            root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdata/iceberg"),
+            root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg/warehouse"),
         }
     }
 }

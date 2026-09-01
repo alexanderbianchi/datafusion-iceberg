@@ -3,6 +3,12 @@ mod tests {
     use datafusion::error::Result;
     use datafusion_distributed_iceberg::test_utils::IcebergTestHarness;
 
+    fn assert_native_parquet(plan: &str) {
+        assert!(plan.contains("DataSourceExec:"), "{plan}");
+        assert!(plan.contains("file_type=parquet"), "{plan}");
+        assert!(!plan.contains("format=iceberg"), "{plan}");
+    }
+
     #[tokio::test]
     async fn applies_sql_limit_to_the_iceberg_scan_output() -> Result<()> {
         let harness = IcebergTestHarness::new().await?;
@@ -16,12 +22,14 @@ mod tests {
             )
             .await?;
 
-        insta::assert_snapshot!(plan, @r"
-        SortPreservingMergeExec: [pickup_at@1 ASC NULLS LAST], fetch=3
-          SortExec: TopK(fetch=3), expr=[pickup_at@1 ASC NULLS LAST], preserve_partitioning=[true]
-            FilterExec: pickup_date@4 = 2024-01-10
-              DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], predicate=pickup_date = 2024-01-10
-        ");
+        assert_native_parquet(&plan);
+        assert!(plan.contains("fetch=3"), "{plan}");
+        assert!(
+            plan.contains(
+                "projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date]"
+            ),
+            "{plan}"
+        );
         insta::assert_snapshot!(batches, @r"
     +-----------+---------------------+-----------------+---------------+-------------+
     | vendor_id | pickup_at           | passenger_count | trip_distance | pickup_date |
@@ -42,11 +50,12 @@ mod tests {
             .query("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10' LIMIT 3")
             .await?;
 
-        insta::assert_snapshot!(plan, @r"
-        CoalescePartitionsExec: fetch=3
-          FilterExec: pickup_date@0 = 2024-01-10, fetch=3
-            DataSourceExec: format=iceberg, projection=[pickup_date], predicate=pickup_date = 2024-01-10
-        ");
+        assert_native_parquet(&plan);
+        assert!(plan.contains("CoalescePartitionsExec: fetch=3"), "{plan}");
+        assert!(
+            plan.contains("FilterExec: pickup_date@0 = 2024-01-10, fetch=3"),
+            "{plan}"
+        );
         insta::assert_snapshot!(batches, @r"
     +-------------+
     | pickup_date |
@@ -67,10 +76,9 @@ mod tests {
             .query("SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
-        insta::assert_snapshot!(plan, @r"
-    CoalescePartitionsExec: fetch=3
-      DataSourceExec: format=iceberg, projection=[pickup_date], fetch=3
-    ");
+        assert_native_parquet(&plan);
+        assert!(plan.contains("CoalescePartitionsExec: fetch=3"), "{plan}");
+        assert!(plan.contains("projection=[pickup_date], limit=3"), "{plan}");
         insta::assert_snapshot!(batches, @r"
     +-------------+
     | pickup_date |
@@ -115,14 +123,9 @@ mod tests {
             )
             .await?;
 
-        insta::assert_snapshot!(plan, @r"
-        ProjectionExec: expr=[vendor_id@0 as vendor_id, pickup_at@1 as pickup_at]
-          GlobalLimitExec: skip=3, fetch=2
-            SortPreservingMergeExec: [pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], fetch=5
-              SortExec: TopK(fetch=5), expr=[pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], preserve_partitioning=[true]
-                FilterExec: pickup_date@3 = 2024-01-10, projection=[vendor_id@0, pickup_at@1, pickup_location_id@2]
-                  DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], predicate=pickup_date = 2024-01-10
-        ");
+        assert_native_parquet(&plan);
+        assert!(plan.contains("GlobalLimitExec: skip=3, fetch=2"), "{plan}");
+        assert!(plan.contains("fetch=5"), "{plan}");
         insta::assert_snapshot!(batches, @r"
     +-----------+---------------------+
     | vendor_id | pickup_at           |

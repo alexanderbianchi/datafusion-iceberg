@@ -7,8 +7,6 @@ use delegate::delegate;
 use iceberg::io::StorageFactory;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 
-use crate::codec::IcebergCodec;
-use crate::distributed_desired_task_count_handler::iceberg_desired_task_count;
 use crate::{IcebergConfig, IcebergTableProviderFactory};
 
 /// Configuration required to register the Iceberg SQL integration.
@@ -96,10 +94,17 @@ fn iceberg_config_mut(config: &mut SessionConfig) -> &mut IcebergConfig {
         .expect("IcebergConfig was inserted above")
 }
 
+fn configure_iceberg(config: &mut SessionConfig) {
+    iceberg_config_mut(config);
+    config.set_distributed_user_codec(crate::codec::IcebergCodec);
+    config.set_distributed_desired_task_count_handler(crate::distributed::range_leaf_desired_tasks);
+    config.set_distributed_scale_up_leaf_node_handler(crate::distributed::preserve_range_leaf);
+}
+
 const TABLE_FACTORY_IDENTIFIER: &str = "ICEBERG";
 
 fn set_iceberg_integration(state: &mut SessionState, options: IcebergIntegrationOptions) {
-    iceberg_config_mut(state.config_mut());
+    configure_iceberg(state.config_mut());
     state.table_factories_mut().insert(
         TABLE_FACTORY_IDENTIFIER.to_string(),
         Arc::new(IcebergTableProviderFactory::new_with_runtime(
@@ -107,13 +112,11 @@ fn set_iceberg_integration(state: &mut SessionState, options: IcebergIntegration
             options.iceberg_runtime,
         )),
     );
-    state.set_distributed_desired_task_count_handler(iceberg_desired_task_count);
-    state.set_distributed_user_codec(IcebergCodec);
 }
 
 impl IcebergExt for SessionStateBuilder {
     fn set_iceberg_integration(&mut self, options: IcebergIntegrationOptions) {
-        iceberg_config_mut(self.config().get_or_insert_default());
+        configure_iceberg(self.config().get_or_insert_default());
         self.table_factories().get_or_insert_default().insert(
             TABLE_FACTORY_IDENTIFIER.to_string(),
             Arc::new(IcebergTableProviderFactory::new_with_runtime(
@@ -121,8 +124,6 @@ impl IcebergExt for SessionStateBuilder {
                 options.iceberg_runtime,
             )),
         );
-        self.set_distributed_desired_task_count_handler(iceberg_desired_task_count);
-        self.set_distributed_user_codec(IcebergCodec);
     }
 
     delegate! {

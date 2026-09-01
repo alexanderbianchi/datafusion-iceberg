@@ -2,18 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::memory::DataSourceExec;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Result, plan_datafusion_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
-use iceberg::arrow::schema_to_arrow_schema;
 
-use crate::IcebergDataSource;
 use crate::common::df_err;
-use crate::data_source::IcebergDataSourceOptions;
+use crate::data_source::{NativeScanOptions, plan_native_scan};
+use crate::schema::{iceberg_schema_to_arrow, reorder_identity_partitions_last};
 
 /// Static, read-only provider for a table or a specific snapshot.
 #[derive(Debug, Clone)]
@@ -21,7 +18,7 @@ pub struct IcebergStaticTableProvider {
     table: iceberg::table::Table,
     snapshot_id: Option<i64>,
     schema: SchemaRef,
-    iceberg_runtime: iceberg::Runtime,
+    _iceberg_runtime: iceberg::Runtime,
 }
 
 impl IcebergStaticTableProvider {
@@ -47,11 +44,17 @@ impl IcebergStaticTableProvider {
             Arc::clone(table.metadata().current_schema())
         };
 
+        let arrow_schema = iceberg_schema_to_arrow(&table_schema)?;
+        let arrow_schema = reorder_identity_partitions_last(
+            &arrow_schema,
+            &table_schema,
+            table.metadata().default_partition_spec(),
+        );
         Ok(Self {
             table,
             snapshot_id,
-            schema: Arc::new(schema_to_arrow_schema(&table_schema).map_err(df_err)?),
-            iceberg_runtime,
+            schema: Arc::new(arrow_schema),
+            _iceberg_runtime: iceberg_runtime,
         })
     }
 }
@@ -73,18 +76,23 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
-            self.table.clone(),
+        plan_native_scan(
+            &self.table,
             self.schema.clone(),
-            Partitioning::UnknownPartitioning(state.config().target_partitions()),
-            IcebergDataSourceOptions {
+            NativeScanOptions {
+                session: state,
                 snapshot_id: self.snapshot_id,
                 projection,
                 filters,
-                fetch: limit,
-                iceberg_runtime: Some(self.iceberg_runtime.clone()),
+                limit,
+                target_partitions: state.config().target_partitions(),
+                parquet_options: datafusion::config::TableParquetOptions {
+                    global: state.config().options().execution.parquet.clone(),
+                    ..Default::default()
+                },
             },
-        )))
+        )
+        .await
     }
 
     fn supports_filters_pushdown(

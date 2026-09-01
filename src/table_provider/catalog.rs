@@ -3,18 +3,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::datasource::source::DataSourceExec;
+use datafusion::common::SchemaExt;
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
-use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use crate::IcebergDataSource;
 use crate::common::df_err;
-use crate::data_source::IcebergDataSourceOptions;
+use crate::data_source::{NativeScanOptions, plan_native_scan};
+use crate::schema::{iceberg_schema_to_arrow, reorder_identity_partitions_last};
 
 /// Catalog-backed, read-only table provider with automatic metadata refresh.
 ///
@@ -25,7 +25,7 @@ pub struct IcebergCatalogTableProvider {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     schema: SchemaRef,
-    iceberg_runtime: iceberg::Runtime,
+    _iceberg_runtime: iceberg::Runtime,
 }
 
 impl IcebergCatalogTableProvider {
@@ -38,13 +38,19 @@ impl IcebergCatalogTableProvider {
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
         let table = catalog.load_table(&table_ident).await.map_err(df_err)?;
-        let schema = schema_to_arrow_schema(table.metadata().current_schema()).map_err(df_err)?;
+        let current_schema = table.metadata().current_schema();
+        let schema = iceberg_schema_to_arrow(current_schema)?;
+        let schema = reorder_identity_partitions_last(
+            &schema,
+            current_schema,
+            table.metadata().default_partition_spec(),
+        );
 
         Ok(Self {
             catalog,
             table_ident,
             schema: Arc::new(schema),
-            iceberg_runtime,
+            _iceberg_runtime: iceberg_runtime,
         })
     }
 }
@@ -72,18 +78,23 @@ impl TableProvider for IcebergCatalogTableProvider {
             .await
             .map_err(df_err)?;
 
-        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
-            table,
+        plan_native_scan(
+            &table,
             self.schema.clone(),
-            Partitioning::UnknownPartitioning(state.config().target_partitions()),
-            IcebergDataSourceOptions {
+            NativeScanOptions {
+                session: state,
                 snapshot_id: None,
                 projection,
                 filters,
-                fetch: limit,
-                iceberg_runtime: Some(self.iceberg_runtime.clone()),
+                limit,
+                target_partitions: state.config().target_partitions(),
+                parquet_options: datafusion::config::TableParquetOptions {
+                    global: state.config().options().execution.parquet.clone(),
+                    ..Default::default()
+                },
             },
-        )))
+        )
+        .await
     }
 
     fn supports_filters_pushdown(
@@ -91,5 +102,26 @@ impl TableProvider for IcebergCatalogTableProvider {
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+        if insert_op != InsertOp::Append {
+            return Err(datafusion::error::DataFusionError::NotImplemented(format!(
+                "Iceberg {insert_op} is not implemented; INSERT append is supported"
+            )));
+        }
+        let sink = crate::insert::IcebergInsertSink::new(
+            Arc::clone(&self.catalog),
+            self.table_ident.clone(),
+            Arc::clone(&self.schema),
+        );
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 }

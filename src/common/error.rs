@@ -1,7 +1,11 @@
 use datafusion::error::DataFusionError;
-use iceberg::{Error, ErrorKind};
+use iceberg::Error;
+
+#[cfg(test)]
+use iceberg::ErrorKind;
 
 /// Converts a datafusion error into an iceberg error.
+#[cfg(test)]
 pub fn iceberg_err(error: DataFusionError) -> Error {
     let fallback_message = error.to_string();
     let DataFusionError::Context(ctx, err) = error else {
@@ -35,6 +39,7 @@ pub fn df_err(error: Error) -> DataFusionError {
     )
 }
 
+#[cfg(test)]
 fn parse_iceberg_error_kind(context: &str) -> Option<ErrorKind> {
     let kind = context.strip_prefix("IcebergError(")?.strip_suffix(')')?;
 
@@ -52,6 +57,7 @@ fn parse_iceberg_error_kind(context: &str) -> Option<ErrorKind> {
     }
 }
 
+#[cfg(test)]
 fn strip_error_kind(kind: ErrorKind, message: &str) -> String {
     let kind = kind.into_static();
     if message == kind {

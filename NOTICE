@@ -1,0 +1,13 @@
+DataFusion Iceberg
+Copyright 2026 Alex Bianchi
+
+This product includes software developed by the DataFusion Distributed
+contributors (https://github.com/datafusion-contrib/datafusion-distributed).
+
+Portions of this product are derived from LakeSail
+(https://github.com/lakehq/sail), revision
+1a449ec44fabc53ee38f19661b5dbe47e45aa676. Those portions are identified by
+file-level provenance comments.
+
+DataFusion Distributed and LakeSail are licensed under the Apache License,
+Version 2.0.
