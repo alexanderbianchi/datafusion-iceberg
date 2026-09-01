@@ -28,7 +28,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    Partitioning, PlanProperties, SendableRecordBatchStream,
+    PlanProperties, SendableRecordBatchStream,
 };
 use futures::future::BoxFuture;
 use futures::stream::TryStreamExt;
@@ -122,7 +122,7 @@ impl IcebergDeleteApplyExec {
     ) -> Self {
         let cache = Arc::new(PlanProperties::new(
             input.equivalence_properties().clone(),
-            Partitioning::UnknownPartitioning(1),
+            input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
         ));
@@ -192,11 +192,11 @@ impl ExecutionPlan for IcebergDeleteApplyExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        vec![true]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -231,13 +231,8 @@ impl ExecutionPlan for IcebergDeleteApplyExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "IcebergDeleteApplyExec only supports partition 0, got {partition}"
-            )));
-        }
         let schema = self.schema();
-        let mut child = self.input.execute(0, Arc::clone(&context))?;
+        let mut child = self.input.execute(partition, Arc::clone(&context))?;
         let data_file_path = self.data_file_path.clone();
         let positional_deletes = self.positional_deletes.clone();
         let equality_deletes = self.equality_deletes.clone();
@@ -245,6 +240,12 @@ impl ExecutionPlan for IcebergDeleteApplyExec {
         let iceberg_schema = Arc::clone(&self.iceberg_schema);
 
         let stream = try_stream! {
+            // Range-aligned dirty branches deliberately contain empty file groups
+            // outside the data file's bucket. Avoid opening delete files for those
+            // partitions, while keeping a one-to-one partition mapping to the child.
+            let Some(first_batch) = child.try_next().await? else {
+                return;
+            };
             let positions = load_positions(
                 &context,
                 &table_url,
@@ -259,7 +260,8 @@ impl ExecutionPlan for IcebergDeleteApplyExec {
             ).await?;
 
             let mut row_offset = 0_u64;
-            while let Some(batch) = child.try_next().await? {
+            let mut next_batch = Some(first_batch);
+            while let Some(batch) = next_batch {
                 let mask = delete_mask(&batch, row_offset, &positions, &equality)?;
                 row_offset += batch.num_rows() as u64;
                 let filtered = filter_record_batch(&batch, &mask)
@@ -267,6 +269,7 @@ impl ExecutionPlan for IcebergDeleteApplyExec {
                 if filtered.num_rows() != 0 {
                     yield filtered;
                 }
+                next_batch = child.try_next().await?;
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))

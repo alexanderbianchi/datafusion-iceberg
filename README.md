@@ -24,7 +24,9 @@ than being hidden behind `iceberg-rust`'s `ArrowReader`.
 - Merge-on-read for Iceberg position deletes and equality deletes. Delete files
   are applied before user filters, preserving Iceberg row-position semantics.
 - Exact DataFusion range partitioning for tables with one identity partition
-  field, with deterministic contiguous file groups and range boundaries.
+  field, with deterministic contiguous file groups and range boundaries. Mixed
+  clean and merge-on-read data files share one global layout and are combined
+  with DataFusion's `InterleaveExec` without losing the range contract.
 - DataFusion Distributed 4.x execution. A custom codec transports merge-on-read
   plans to workers, and range buckets are assigned contiguously rather than
   round-robin.
@@ -70,9 +72,10 @@ The default storage factory resolves `file://`, S3 (`s3://`, `s3a://`,
   ambiguous.
 - DataFusion Distributed does not yet preserve a global range contract on its
   network nodes ([DFD #628](https://github.com/datafusion-contrib/datafusion-distributed/issues/628)).
-  This crate preserves the exact range contract on the coordinator scan and
-  gives each worker a contiguous set of range buckets; worker transport plans
-  intentionally expose ordinary single-partition output.
+  This crate preserves the exact range contract through `InterleaveExec` inside
+  the scan stage and gives each worker a contiguous set of range buckets. A
+  pass-through stage wrapper conservatively forgets the range only at DFD's
+  network boundary; it does not repartition or shuffle rows.
 - `UPDATE`, `DELETE`, and `MERGE INTO` mutation planning are not implemented.
   Merge-on-read consumes delete files already present in a table, while writes
   currently support append inserts.

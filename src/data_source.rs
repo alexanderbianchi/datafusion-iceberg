@@ -26,12 +26,14 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
     LexOrdering, Partitioning, PhysicalExpr, PhysicalSortExpr, RangePartitioning, SplitPoint,
 };
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::Expr;
+use datafusion_distributed::DistributedConfig;
 use futures::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
@@ -135,7 +137,7 @@ pub(crate) async fn plan_native_scan(
         default_spec,
         Arc::clone(&file_schema),
     )?;
-    let (file_groups, output_partitioning) = create_file_groups(
+    let (file_groups, output_partitioning, _) = create_file_groups(
         files,
         &partition_fields,
         partition_fields.first().and_then(|field| {
@@ -175,85 +177,97 @@ fn plan_merge_on_read(
     default_spec: &iceberg::spec::PartitionSpec,
     options: NativeScanOptions<'_>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    for task in &tasks {
+        if !task.deletes.is_empty() && (task.start != 0 || task.length < task.file_size_in_bytes) {
+            return Err(DataFusionError::Plan(format!(
+                "merge-on-read requires a complete scan of data file {}, got byte range {}..{}",
+                task.data_file_path,
+                task.start,
+                task.start.saturating_add(task.length)
+            )));
+        }
+    }
+
+    let range_branches = build_range_merge_on_read_branches(
+        table,
+        Arc::clone(&table_schema),
+        tasks.clone(),
+        identity_fields,
+        partition_fields,
+        default_spec,
+        options.target_partitions,
+        options.parquet_options.clone(),
+    )?;
+
     let mut clean = Vec::new();
     let mut dirty = Vec::new();
     for task in tasks {
         if task.deletes.is_empty() {
             clean.push(task);
         } else {
-            if task.start != 0 || task.length < task.file_size_in_bytes {
-                return Err(DataFusionError::Plan(format!(
-                    "merge-on-read requires a complete scan of data file {}, got byte range {}..{}",
-                    task.data_file_path,
-                    task.start,
-                    task.start.saturating_add(task.length)
-                )));
-            }
             dirty.push(task);
         }
     }
 
-    let mut branches = Vec::<Arc<dyn ExecutionPlan>>::new();
-    if !clean.is_empty() {
-        branches.push(build_native_exec(
-            table,
-            Arc::clone(&table_schema),
-            clean,
-            identity_fields,
-            partition_fields,
-            default_spec,
-            options.target_partitions,
-            options.parquet_options.clone(),
-            None,
-            None,
-        )?);
-    }
-
-    for task in dirty {
-        let data_file_path = task.data_file_path.clone();
-        let mut positional = Vec::new();
-        let mut equality = Vec::new();
-        for delete in task.deletes.clone() {
-            match delete.file_type {
-                DataContentType::PositionDeletes => positional.push(delete),
-                DataContentType::EqualityDeletes => equality.push(delete),
-                DataContentType::Data => {
-                    return Err(DataFusionError::Plan(format!(
-                        "scan task for {data_file_path} attached a data file as a delete file"
-                    )));
-                }
-            }
+    let (mut branches, range_aligned) = if let Some(branches) = range_branches {
+        (branches, true)
+    } else {
+        let mut branches = Vec::<Arc<dyn ExecutionPlan>>::new();
+        if !clean.is_empty() {
+            branches.push(build_native_exec(
+                table,
+                Arc::clone(&table_schema),
+                clean,
+                identity_fields,
+                partition_fields,
+                default_spec,
+                options.target_partitions,
+                options.parquet_options.clone(),
+                None,
+                None,
+            )?);
         }
-        let scan = build_native_exec(
-            table,
-            Arc::clone(&table_schema),
-            vec![task],
-            identity_fields,
-            partition_fields,
-            default_spec,
-            1,
-            options.parquet_options.clone(),
-            None,
-            None,
-        )?;
-        branches.push(Arc::new(crate::delete_apply::IcebergDeleteApplyExec::new(
-            scan,
-            data_file_path,
-            positional,
-            equality,
-            table.metadata().location().to_string(),
-            Arc::clone(table.metadata().current_schema()),
-        )));
-    }
+        for task in dirty {
+            let scan = build_native_exec(
+                table,
+                Arc::clone(&table_schema),
+                vec![task.clone()],
+                identity_fields,
+                partition_fields,
+                default_spec,
+                1,
+                options.parquet_options.clone(),
+                None,
+                None,
+            )?;
+            branches.push(build_delete_apply(table, scan, task)?);
+        }
+        (branches, false)
+    };
 
-    let unioned = match branches.len() {
+    let combined = match branches.len() {
         0 => {
             return Err(DataFusionError::Internal(
                 "merge-on-read scan produced no branches".into(),
             ));
         }
         1 => branches.pop().unwrap(),
+        _ if range_aligned => Arc::new(InterleaveExec::try_new(branches)?),
         _ => UnionExec::try_new(branches)?,
+    };
+    // DFD 4 cannot carry a global RangePartitioning through a network boundary
+    // (#628). Keep the exact range on InterleaveExec inside the worker stage,
+    // then deliberately erase only the boundary contract. DFD specializes each
+    // worker to a contiguous range slice; the pass-through wrapper does not
+    // repartition rows.
+    let combined: Arc<dyn ExecutionPlan> = if range_aligned
+        && DistributedConfig::from_session_config(options.session.config()).is_ok()
+    {
+        Arc::new(CoalescePartitionsExec::new(Arc::new(
+            crate::distributed::IcebergRangeStageExec::new(combined),
+        )))
+    } else {
+        combined
     };
     let filtered: Arc<dyn ExecutionPlan> = if let Some(predicate) =
         datafusion::logical_expr::utils::conjunction(options.filters.to_vec())
@@ -263,10 +277,10 @@ fn plan_merge_on_read(
             options
                 .session
                 .create_physical_expr(predicate, &df_schema)?,
-            unioned,
+            combined,
         )?)
     } else {
-        unioned
+        combined
     };
     let projected: Arc<dyn ExecutionPlan> = if let Some(projection) = options.projection {
         let expressions: Vec<(Arc<dyn PhysicalExpr>, String)> = projection
@@ -290,6 +304,120 @@ fn plan_merge_on_read(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_range_merge_on_read_branches(
+    table: &iceberg::table::Table,
+    table_schema: SchemaRef,
+    tasks: Vec<FileScanTask>,
+    identity_fields: &[FieldRef],
+    partition_fields: &[FieldRef],
+    default_spec: &iceberg::spec::PartitionSpec,
+    target_partitions: usize,
+    parquet_options: TableParquetOptions,
+) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    let (object_store_url, files) = build_partitioned_files(
+        tasks.clone(),
+        identity_fields,
+        table.metadata().current_schema(),
+        default_spec,
+        Arc::clone(&table_schema),
+    )?;
+    let (_, output_partitioning, buckets) = create_file_groups(
+        files.clone(),
+        partition_fields,
+        partition_fields.first().and_then(|field| {
+            table_schema
+                .fields()
+                .iter()
+                .position(|candidate| candidate.name() == field.name())
+        }),
+        target_partitions.max(1),
+    )?;
+    let Some(output_partitioning @ Partitioning::Range(_)) = output_partitioning else {
+        return Ok(None);
+    };
+    let partition_count = output_partitioning.partition_count();
+    let mut clean_groups = vec![Vec::new(); partition_count];
+    let mut dirty = Vec::new();
+    for (((task, file), bucket), file_index) in tasks.into_iter().zip(files).zip(buckets).zip(0..) {
+        if bucket >= partition_count {
+            return Err(DataFusionError::Internal(format!(
+                "file {file_index} was assigned to range bucket {bucket}, but only {partition_count} buckets exist"
+            )));
+        }
+        let file = file.with_partition_values(vec![]);
+        if task.deletes.is_empty() {
+            clean_groups[bucket].push(file);
+        } else {
+            dirty.push((task, file, bucket));
+        }
+    }
+
+    let mut branches = Vec::<Arc<dyn ExecutionPlan>>::new();
+    if clean_groups.iter().any(|group| !group.is_empty()) {
+        branches.push(build_parquet_exec(
+            table,
+            Arc::clone(&table_schema),
+            object_store_url.clone(),
+            clean_groups.into_iter().map(FileGroup::new).collect(),
+            Some(output_partitioning.clone()),
+            parquet_options.clone(),
+            None,
+            None,
+        )?);
+    }
+    for (task, file, bucket) in dirty {
+        let mut groups = vec![FileGroup::new(vec![]); partition_count];
+        groups[bucket] = FileGroup::new(vec![file]);
+        let scan = build_parquet_exec(
+            table,
+            Arc::clone(&table_schema),
+            object_store_url.clone(),
+            groups,
+            Some(output_partitioning.clone()),
+            parquet_options.clone(),
+            None,
+            None,
+        )?;
+        branches.push(build_delete_apply(table, scan, task)?);
+    }
+    debug_assert!(
+        branches
+            .iter()
+            .all(|branch| branch.output_partitioning() == &output_partitioning)
+    );
+    Ok(Some(branches))
+}
+
+fn build_delete_apply(
+    table: &iceberg::table::Table,
+    scan: Arc<dyn ExecutionPlan>,
+    task: FileScanTask,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let data_file_path = task.data_file_path;
+    let mut positional = Vec::new();
+    let mut equality = Vec::new();
+    for delete in task.deletes {
+        match delete.file_type {
+            DataContentType::PositionDeletes => positional.push(delete),
+            DataContentType::EqualityDeletes => equality.push(delete),
+            DataContentType::Data => {
+                return Err(DataFusionError::Plan(format!(
+                    "scan task for {data_file_path} attached a data file as a delete file"
+                )));
+            }
+        }
+    }
+    Ok(Arc::new(crate::delete_apply::IcebergDeleteApplyExec::new(
+        scan,
+        data_file_path,
+        positional,
+        equality,
+        table.metadata().location().to_string(),
+        Arc::clone(table.metadata().current_schema()),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_native_exec(
     table: &iceberg::table::Table,
     table_schema: SchemaRef,
@@ -309,7 +437,7 @@ fn build_native_exec(
         default_spec,
         Arc::clone(&table_schema),
     )?;
-    let (file_groups, output_partitioning) = create_file_groups(
+    let (file_groups, output_partitioning, _) = create_file_groups(
         files,
         partition_fields,
         partition_fields.first().and_then(|field| {
@@ -320,6 +448,29 @@ fn build_native_exec(
         }),
         target_partitions.max(1),
     )?;
+    build_parquet_exec(
+        table,
+        table_schema,
+        object_store_url,
+        file_groups,
+        output_partitioning,
+        parquet_options,
+        projection,
+        limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_parquet_exec(
+    table: &iceberg::table::Table,
+    table_schema: SchemaRef,
+    object_store_url: ObjectStoreUrl,
+    file_groups: Vec<FileGroup>,
+    output_partitioning: Option<Partitioning>,
+    parquet_options: TableParquetOptions,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let range_partitioned = output_partitioning.is_some();
     let source = Arc::new(
         ParquetSource::new(TableSchema::from(Arc::clone(&table_schema)))
@@ -490,13 +641,13 @@ fn build_partitioned_files(
 }
 
 fn create_file_groups(
-    mut files: Vec<PartitionedFile>,
+    files: Vec<PartitionedFile>,
     partition_fields: &[FieldRef],
     partition_column_index: Option<usize>,
     target_partitions: usize,
-) -> Result<(Vec<FileGroup>, Option<Partitioning>)> {
+) -> Result<(Vec<FileGroup>, Option<Partitioning>, Vec<usize>)> {
     if files.is_empty() {
-        return Ok((vec![FileGroup::new(vec![])], None));
+        return Ok((vec![FileGroup::new(vec![])], None, vec![]));
     }
 
     if partition_fields.len() != 1
@@ -506,22 +657,33 @@ fn create_file_groups(
     {
         let count = target_partitions.min(files.len()).max(1);
         let mut groups = (0..count).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut buckets = vec![0; files.len()];
         for (index, file) in files.into_iter().enumerate() {
-            groups[index % count].push(file.with_partition_values(vec![]));
+            let bucket = index % count;
+            buckets[index] = bucket;
+            groups[bucket].push(file.with_partition_values(vec![]));
         }
-        return Ok((groups.into_iter().map(FileGroup::new).collect(), None));
+        return Ok((
+            groups.into_iter().map(FileGroup::new).collect(),
+            None,
+            buckets,
+        ));
     }
 
-    files.sort_by(|left, right| scalar_cmp(&left.partition_values[0], &right.partition_values[0]));
-    let mut key_groups: Vec<(ScalarValue, Vec<PartitionedFile>)> = Vec::new();
-    for file in files {
+    let file_count = files.len();
+    let mut files = files.into_iter().enumerate().collect::<Vec<_>>();
+    files.sort_by(|(_, left), (_, right)| {
+        scalar_cmp(&left.partition_values[0], &right.partition_values[0])
+    });
+    let mut key_groups: Vec<(ScalarValue, Vec<(usize, PartitionedFile)>)> = Vec::new();
+    for (index, file) in files {
         let key = file.partition_values[0].clone();
         if let Some((previous, group)) = key_groups.last_mut()
             && *previous == key
         {
-            group.push(file);
+            group.push((index, file));
         } else {
-            key_groups.push((key, vec![file]));
+            key_groups.push((key, vec![(index, file)]));
         }
     }
 
@@ -529,6 +691,7 @@ fn create_file_groups(
     let keys_per_bucket = key_groups.len().div_ceil(bucket_count);
     let mut groups = Vec::with_capacity(bucket_count);
     let mut split_points = Vec::with_capacity(bucket_count.saturating_sub(1));
+    let mut buckets = vec![0; file_count];
     for (bucket_index, chunk) in key_groups.chunks(keys_per_bucket).enumerate() {
         if bucket_index > 0 {
             split_points.push(SplitPoint::new(vec![chunk[0].0.clone()]));
@@ -537,7 +700,10 @@ fn create_file_groups(
             chunk
                 .iter()
                 .flat_map(|(_, files)| files.iter().cloned())
-                .map(|file| file.with_partition_values(vec![]))
+                .map(|(index, file)| {
+                    buckets[index] = bucket_index;
+                    file.with_partition_values(vec![])
+                })
                 .collect(),
         ));
     }
@@ -558,7 +724,7 @@ fn create_file_groups(
     )])
     .ok_or_else(|| DataFusionError::Internal("range ordering cannot be empty".into()))?;
     let partitioning = Partitioning::Range(RangePartitioning::try_new(ordering, split_points)?);
-    Ok((groups, Some(partitioning)))
+    Ok((groups, Some(partitioning), buckets))
 }
 
 fn scalar_cmp(left: &ScalarValue, right: &ScalarValue) -> Ordering {

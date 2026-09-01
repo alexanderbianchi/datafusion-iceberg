@@ -18,7 +18,8 @@ use iceberg::scan::FileScanTaskDeleteFile;
 use iceberg::spec::DataContentType;
 use prost::Message;
 
-const KIND: &str = "datafusion-iceberg/delete-apply/v1";
+const DELETE_APPLY_KIND: &str = "datafusion-iceberg/delete-apply/v1";
+const RANGE_STAGE_KIND: &str = "datafusion-iceberg/range-stage/v1";
 
 #[derive(Debug)]
 pub(crate) struct IcebergCodec;
@@ -37,6 +38,12 @@ struct DeleteApplyProto {
     table_url: String,
     #[prost(string, tag = "6")]
     iceberg_schema_json: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct NodeKindProto {
+    #[prost(string, tag = "1")]
+    kind: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -90,35 +97,44 @@ impl PhysicalExtensionCodec for IcebergCodec {
         _ctx: &TaskContext,
         _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let proto =
-            DeleteApplyProto::decode(buf).map_err(|error| proto_error(error.to_string()))?;
-        if proto.kind != KIND {
-            return Err(proto_error("not a datafusion-iceberg extension node"));
-        }
+        let node_kind =
+            NodeKindProto::decode(buf).map_err(|error| proto_error(error.to_string()))?;
         let [input] = inputs else {
             return Err(proto_error(format!(
-                "IcebergDeleteApplyExec expects one child, got {}",
+                "{} expects one child, got {}",
+                node_kind.kind,
                 inputs.len()
             )));
         };
-        let schema: iceberg::spec::Schema = serde_json::from_str(&proto.iceberg_schema_json)
-            .map_err(|error| proto_error(error.to_string()))?;
-        Ok(Arc::new(crate::delete_apply::IcebergDeleteApplyExec::new(
-            Arc::clone(input),
-            proto.data_file_path,
-            proto
-                .positional_deletes
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_>>()?,
-            proto
-                .equality_deletes
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_>>()?,
-            proto.table_url,
-            Arc::new(schema),
-        )))
+        match node_kind.kind.as_str() {
+            DELETE_APPLY_KIND => {
+                let proto = DeleteApplyProto::decode(buf)
+                    .map_err(|error| proto_error(error.to_string()))?;
+                let schema: iceberg::spec::Schema =
+                    serde_json::from_str(&proto.iceberg_schema_json)
+                        .map_err(|error| proto_error(error.to_string()))?;
+                Ok(Arc::new(crate::delete_apply::IcebergDeleteApplyExec::new(
+                    Arc::clone(input),
+                    proto.data_file_path,
+                    proto
+                        .positional_deletes
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_>>()?,
+                    proto
+                        .equality_deletes
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_>>()?,
+                    proto.table_url,
+                    Arc::new(schema),
+                )))
+            }
+            RANGE_STAGE_KIND => Ok(Arc::new(crate::distributed::IcebergRangeStageExec::new(
+                Arc::clone(input),
+            ))),
+            _ => Err(proto_error("not a datafusion-iceberg extension node")),
+        }
     }
 
     fn try_encode(
@@ -127,23 +143,30 @@ impl PhysicalExtensionCodec for IcebergCodec {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        let Some(node) = node.downcast_ref::<crate::delete_apply::IcebergDeleteApplyExec>() else {
-            return Err(proto_error(format!(
-                "not an IcebergDeleteApplyExec: {}",
-                node.name()
-            )));
-        };
-        DeleteApplyProto {
-            kind: KIND.to_string(),
-            data_file_path: node.data_file_path().to_string(),
-            positional_deletes: node.positional_deletes().iter().map(Into::into).collect(),
-            equality_deletes: node.equality_deletes().iter().map(Into::into).collect(),
-            table_url: node.table_url().to_string(),
-            iceberg_schema_json: serde_json::to_string(node.iceberg_schema().as_ref())
-                .map_err(|error| proto_error(error.to_string()))?,
+        if let Some(node) = node.downcast_ref::<crate::delete_apply::IcebergDeleteApplyExec>() {
+            return DeleteApplyProto {
+                kind: DELETE_APPLY_KIND.to_string(),
+                data_file_path: node.data_file_path().to_string(),
+                positional_deletes: node.positional_deletes().iter().map(Into::into).collect(),
+                equality_deletes: node.equality_deletes().iter().map(Into::into).collect(),
+                table_url: node.table_url().to_string(),
+                iceberg_schema_json: serde_json::to_string(node.iceberg_schema().as_ref())
+                    .map_err(|error| proto_error(error.to_string()))?,
+            }
+            .encode(buf)
+            .map_err(|error| proto_error(error.to_string()));
         }
-        .encode(buf)
-        .map_err(|error| proto_error(error.to_string()))
+        if node.is::<crate::distributed::IcebergRangeStageExec>() {
+            return NodeKindProto {
+                kind: RANGE_STAGE_KIND.to_string(),
+            }
+            .encode(buf)
+            .map_err(|error| proto_error(error.to_string()));
+        }
+        Err(proto_error(format!(
+            "not a datafusion-iceberg extension node: {}",
+            node.name()
+        )))
     }
 }
 
