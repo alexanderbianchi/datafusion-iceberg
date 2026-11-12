@@ -136,6 +136,16 @@ impl TableProvider for IcebergStaticTableProvider {
             .config_options()
             .extensions
             .get::<IcebergPlanningConfig>()
+            .is_some_and(|config| config.native_parquet_reader)
+        {
+            return Ok(DataSourceExec::from_data_source(
+                source.build_native(state).await?,
+            ));
+        }
+        if state
+            .config_options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
             .is_some_and(|config| config.eager_file_planning)
         {
             Ok(DataSourceExec::from_data_source(

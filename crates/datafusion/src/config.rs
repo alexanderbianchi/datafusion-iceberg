@@ -23,6 +23,8 @@ extensions_options! {
     pub struct IcebergPlanningConfig {
         /// Discover and retain file tasks in TableProvider::scan instead of at execution.
         pub eager_file_planning: bool, default = false
+        /// Plan tasks eagerly and decode data and delete Parquet files with DataFusion.
+        pub native_parquet_reader: bool, default = false
     }
 }
 

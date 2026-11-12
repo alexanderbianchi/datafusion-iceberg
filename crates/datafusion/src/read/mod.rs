@@ -17,10 +17,12 @@
 
 mod eager;
 mod file_planning;
+mod native;
 pub(crate) mod predicate;
 mod reader;
 pub(crate) mod scan;
 
 pub use eager::EagerIcebergDataSource;
+pub use native::IcebergFileSource;
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};

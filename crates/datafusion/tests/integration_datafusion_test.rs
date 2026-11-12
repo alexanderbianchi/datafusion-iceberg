@@ -1262,12 +1262,13 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         .collect()
         .await?;
 
-    for eager in [false, true] {
+    for (eager, native) in [(false, false), (true, false), (true, true)] {
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(1)
                 .with_option_extension(IcebergPlanningConfig::default())
-                .set_bool("iceberg.eager_file_planning", eager),
+                .set_bool("iceberg.eager_file_planning", eager)
+                .set_bool("iceberg.native_parquet_reader", native),
         );
         let plan = provider.scan(&ctx.state(), None, &[], None).await?;
         assert_eq!(plan.schema(), provider.schema());

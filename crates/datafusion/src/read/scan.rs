@@ -18,17 +18,24 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::catalog::Session;
+use datafusion::common::config::TableParquetOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Statistics, internal_err};
+use datafusion::common::{DFSchema, Statistics, exec_err, internal_err};
+use datafusion::datasource::physical_plan::{
+    FileScanConfig, FileScanConfigBuilder, ParquetSource,
+};
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTaskStream, TableScan};
 use iceberg::table::Table;
@@ -81,6 +88,7 @@ impl IcebergDataSource {
             projection: None,
             snapshot_id: None,
             predicate: None,
+            native_filters: Vec::new(),
             fetch: None,
         }
     }
@@ -127,6 +135,7 @@ pub struct IcebergDataSourceBuilder {
     projection: Option<Vec<usize>>,
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
+    native_filters: Vec<Expr>,
     fetch: Option<usize>,
 }
 
@@ -148,14 +157,17 @@ impl IcebergDataSourceBuilder {
     /// Filters the scan with `predicate`, or not at all if `None` (the default).
     pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
         self.predicate = predicate;
+        self.native_filters.clear();
         self
     }
 
-    /// Filters the scan with the parts of `filters` that convert to an Iceberg
-    /// predicate. The rest are dropped, so the scan may return rows that
-    /// `filters` reject.
-    pub fn with_filters(self, filters: &[Expr]) -> Self {
-        self.with_predicate(convert_filters_to_predicate(filters))
+    /// Offers `filters` to the reader and uses convertible parts for Iceberg pruning.
+    ///
+    /// The scan may return rows that `filters` reject; callers must retain residuals.
+    pub fn with_filters(mut self, filters: &[Expr]) -> Self {
+        self.predicate = convert_filters_to_predicate(filters);
+        self.native_filters = filters.to_vec();
+        self
     }
 
     /// Stops after `fetch` rows, or reads every row if `None` (the default).
@@ -213,6 +225,104 @@ impl IcebergDataSourceBuilder {
             reader.build(),
             self.fetch,
         ))
+    }
+
+    /// Plans assigned tasks and reads them with native DataFusion Parquet execution.
+    ///
+    /// Query filters retain the inexact contract of `with_filters`: callers must
+    /// enforce residuals. Delete enforcement is mandatory, including with pushdown disabled.
+    pub async fn build_native(self, state: &dyn Session) -> Result<FileScanConfig> {
+        if self.predicate.is_some() && self.native_filters.is_empty() {
+            return exec_err!(
+                "Native reads require DataFusion filters; use with_filters rather than with_predicate"
+            );
+        }
+        let projected = self.projected_schema()?;
+        let names: Vec<_> = projected
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let scan = build_table_scan(
+            &self.table,
+            self.snapshot_id,
+            Some(&names),
+            self.predicate.as_ref(),
+        )?;
+        let context = state.task_ctx();
+        let files = PlannedFileScan::collect(scan, &context).await?;
+        let read_schema = files
+            .tasks()
+            .first()
+            .map(|task| task.schema_ref())
+            .unwrap_or_else(|| self.table.current_schema_ref());
+        let mut fields = self.schema.fields().to_vec();
+        for field in schema_to_arrow_schema(&read_schema)
+            .map_err(to_datafusion_error)?
+            .fields()
+        {
+            if !fields.iter().any(|existing| {
+                existing
+                    .metadata()
+                    .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                    == field
+                        .metadata()
+                        .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            }) {
+                if fields
+                    .iter()
+                    .any(|existing| existing.name() == field.name())
+                {
+                    return exec_err!(
+                        "Conflicting field IDs for {} in the native read schema",
+                        field.name()
+                    );
+                }
+                fields.push(field.clone());
+            }
+        }
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+        let options = TableParquetOptions {
+            global: state.config_options().execution.parquet.clone(),
+            ..Default::default()
+        };
+        let mut parquet =
+            ParquetSource::new(schema.clone()).with_table_parquet_options(options);
+        if !self.native_filters.is_empty() {
+            let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+            let predicates = self
+                .native_filters
+                .into_iter()
+                .map(|expr| state.create_physical_expr(expr, &df_schema))
+                .collect::<Result<Vec<_>>>()?;
+            parquet = parquet.with_predicate(conjunction(predicates));
+        }
+        let source = super::native::IcebergFileSource::new(
+            parquet,
+            read_schema,
+            self.table.file_io().clone(),
+            context.clone(),
+        )?;
+        let partitions = files
+            .tasks()
+            .len()
+            .max(1)
+            .min(context.session_config().target_partitions().max(1));
+        let mut groups = vec![Vec::new(); partitions];
+        for (index, task) in files.tasks().iter().enumerate() {
+            // The original DataFusion filters remain above the inexact scan and
+            // inside the native source; only their manifest-pruning copy is removed.
+            groups[index % partitions].push(task.clone().without_predicate());
+        }
+        drop(files);
+        let config = source.file_scan_config(groups)?;
+        let projection = self
+            .projection
+            .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+        Ok(FileScanConfigBuilder::from(config)
+            .with_projection_indices(Some(projection))?
+            .with_limit(self.fetch)
+            .build())
     }
 
     /// Build a lazy source and its shared reader without performing file-discovery I/O.

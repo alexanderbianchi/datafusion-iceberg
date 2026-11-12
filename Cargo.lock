@@ -3159,7 +3159,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3#5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3"
+source = "git+https://github.com/alexanderbianchi/iceberg-rust?rev=48064cb87d71c0d8c39f1a62df198d3e3aab8fc1#48064cb87d71c0d8c39f1a62df198d3e3aab8fc1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3217,7 +3217,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3#5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3"
+source = "git+https://github.com/alexanderbianchi/iceberg-rust?rev=48064cb87d71c0d8c39f1a62df198d3e3aab8fc1#48064cb87d71c0d8c39f1a62df198d3e3aab8fc1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3242,6 +3242,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "datafusion",
+ "datafusion-datasource",
+ "datafusion-datasource-parquet",
  "futures",
  "iceberg",
  "insta",
@@ -3279,7 +3281,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3#5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3"
+source = "git+https://github.com/alexanderbianchi/iceberg-rust?rev=48064cb87d71c0d8c39f1a62df198d3e3aab8fc1#48064cb87d71c0d8c39f1a62df198d3e3aab8fc1"
 dependencies = [
  "proc-macro2",
  "quote",

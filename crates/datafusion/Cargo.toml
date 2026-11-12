@@ -33,6 +33,8 @@ async-trait = { workspace = true }
 bytes = "1"
 dashmap = "6"
 datafusion = { workspace = true }
+datafusion-datasource = "55.0.0"
+datafusion-datasource-parquet = "55.0.0"
 futures = "0.3"
 iceberg = { workspace = true }
 parquet = "59.2"
